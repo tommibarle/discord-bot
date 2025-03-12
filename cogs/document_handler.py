@@ -6,7 +6,7 @@ from typing import Optional, List
 import io
 from utils.validators import validate_file
 from utils.embed_builder import create_document_embed
-from app import db
+from app import app, db
 from models.document import Document
 
 logger = logging.getLogger(__name__)
@@ -32,10 +32,21 @@ class DocumentUploadView(discord.ui.View):
             # Update button label to show document count
             button.label = f"Documenti Allegati: {len(self.documents)}"
 
-            await interaction.edit_original_response(view=self)
+            # Use edit_original_response instead of edit_original_message
+            try:
+                await interaction.message.edit(view=self)
+            except Exception as e:
+                logger.error(f"Error updating view: {e}")
+                # If edit fails, at least confirm to the user
+                await interaction.followup.send(
+                    "Documento allegato con successo!",
+                    ephemeral=True
+                )
 
     @discord.ui.button(label="Invia", style=discord.ButtonStyle.green)
     async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.debug("Submit button clicked")
+
         if not self.documents:
             await interaction.response.send_message(
                 "Per favore allega almeno un documento prima!",
@@ -44,21 +55,14 @@ class DocumentUploadView(discord.ui.View):
             return
 
         try:
-            # Send all documents in a single message and store in database
+            # First defer the response to prevent timeout
+            logger.debug("Deferring response")
+            await interaction.response.defer(ephemeral=True)
+
             files = []
             embeds = []
 
             for idx, doc in enumerate(self.documents, 1):
-                # Create database entry
-                db_doc = Document(
-                    name=self.name,
-                    content=doc['content'],
-                    context=doc['context'],
-                    author_id=str(interaction.user.id),
-                    author_name=interaction.user.display_name
-                )
-                db.session.add(db_doc)
-
                 # Create Discord file and embed
                 file = discord.File(
                     io.BytesIO(doc['content']),
@@ -74,27 +78,60 @@ class DocumentUploadView(discord.ui.View):
                 )
                 embeds.append(embed)
 
-            # Commit all documents to database
-            db.session.commit()
-
-            await interaction.channel.send(
+            # Send documents to channel first
+            logger.debug("Sending documents to channel")
+            message = await interaction.channel.send(
                 embeds=embeds,
                 files=files
             )
 
-            await interaction.response.send_message(
+            # Use Flask app context for database operations
+            with app.app_context():
+                try:
+                    logger.debug("Adding documents to database")
+                    # Add all documents to the database
+                    for doc in self.documents:
+                        db_doc = Document(
+                            name=self.name,
+                            content=doc['content'],
+                            context=doc['context'],
+                            author_id=str(interaction.user.id),
+                            author_name=interaction.user.display_name
+                        )
+                        db.session.add(db_doc)
+
+                    logger.debug("Committing to database")
+                    db.session.commit()
+                    logger.debug("Database commit successful")
+                except Exception as e:
+                    logger.error(f"Database error: {e}", exc_info=True)
+                    db.session.rollback()
+                    if message:
+                        await message.delete()
+                    await interaction.followup.send(
+                        "Errore durante il salvataggio dei documenti nel database.",
+                        ephemeral=True
+                    )
+                    return
+
+            # Send success message using followup
+            logger.debug("Sending success message")
+            await interaction.followup.send(
                 "Documenti caricati con successo!",
                 ephemeral=True
             )
+
             self.stop()
 
         except Exception as e:
-            logger.error(f"Error submitting documents: {e}")
-            db.session.rollback()
-            await interaction.response.send_message(
-                "Errore durante il caricamento dei documenti. Riprova.",
-                ephemeral=True
-            )
+            logger.error(f"Error in submit: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    "Errore durante il caricamento dei documenti. Riprova.",
+                    ephemeral=True
+                )
+            except discord.errors.InteractionNotFound:
+                logger.error("Could not send error message - interaction expired")
 
 class DocumentUploadModal(discord.ui.Modal, title="Carica Documento"):
     context_input = discord.ui.TextInput(
@@ -166,8 +203,9 @@ class DocumentHandler(commands.Cog):
     )
     async def activities(self, interaction: discord.Interaction, nome: str):
         try:
-            # Query documents from database
-            documents = Document.query.filter_by(name=nome).all()
+            with app.app_context():
+                # Query documents from database
+                documents = Document.query.filter_by(name=nome).all()
 
             if not documents:
                 await interaction.response.send_message(
