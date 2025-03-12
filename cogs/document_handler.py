@@ -2,105 +2,130 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import logging
-from typing import Optional
+from typing import Optional, List
 import io
 from utils.validators import validate_file
 from utils.embed_builder import create_document_embed
+from app import db
+from models.document import Document
 
 logger = logging.getLogger(__name__)
 
 class DocumentUploadView(discord.ui.View):
-    def __init__(self, timeout: Optional[float] = 180):
+    def __init__(self, name: str, timeout: Optional[float] = 180):
         super().__init__(timeout=timeout)
-        self.context_text = None
-        self.file = None
-        
-    @discord.ui.button(label="Attach Document", style=discord.ButtonStyle.primary)
+        self.documents = []  # List to store multiple documents
+        self.name = name
+
+    @discord.ui.button(label="Allega Documento", style=discord.ButtonStyle.primary)
     async def attach_document(self, interaction: discord.Interaction, button: discord.ui.Button):
         modal = DocumentUploadModal()
         await interaction.response.send_modal(modal)
         await modal.wait()
-        
+
         if modal.file_content and modal.context_text:
-            self.context_text = modal.context_text
-            self.file = modal.file_content
-            button.disabled = True
-            button.label = "Document Attached"
-            button.style = discord.ButtonStyle.success
-            
+            self.documents.append({
+                'content': modal.file_content,
+                'context': modal.context_text
+            })
+
+            # Update button label to show document count
+            button.label = f"Documenti Allegati: {len(self.documents)}"
+
             await interaction.edit_original_response(view=self)
 
-    @discord.ui.button(label="Submit", style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Invia", style=discord.ButtonStyle.green)
     async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.file or not self.context_text:
+        if not self.documents:
             await interaction.response.send_message(
-                "Please attach a document and provide context first!",
+                "Per favore allega almeno un documento prima!",
                 ephemeral=True
             )
             return
 
         try:
-            # Create file object from the stored content
-            file = discord.File(
-                io.BytesIO(self.file),
-                filename="document.txt"
-            )
-            
-            # Create and send embed with the document
-            embed = create_document_embed(
-                author=interaction.user,
-                context=self.context_text
-            )
-            
+            # Send all documents in a single message and store in database
+            files = []
+            embeds = []
+
+            for idx, doc in enumerate(self.documents, 1):
+                # Create database entry
+                db_doc = Document(
+                    name=self.name,
+                    content=doc['content'],
+                    context=doc['context'],
+                    author_id=str(interaction.user.id),
+                    author_name=interaction.user.display_name
+                )
+                db.session.add(db_doc)
+
+                # Create Discord file and embed
+                file = discord.File(
+                    io.BytesIO(doc['content']),
+                    filename=f"documento_{idx}.txt"
+                )
+                files.append(file)
+
+                embed = create_document_embed(
+                    author=interaction.user,
+                    context=doc['context'],
+                    index=idx,
+                    name=self.name
+                )
+                embeds.append(embed)
+
+            # Commit all documents to database
+            db.session.commit()
+
             await interaction.channel.send(
-                embed=embed,
-                file=file
+                embeds=embeds,
+                files=files
             )
-            
+
             await interaction.response.send_message(
-                "Document uploaded successfully!",
+                "Documenti caricati con successo!",
                 ephemeral=True
             )
             self.stop()
-            
+
         except Exception as e:
-            logger.error(f"Error submitting document: {e}")
+            logger.error(f"Error submitting documents: {e}")
+            db.session.rollback()
             await interaction.response.send_message(
-                "Failed to submit document. Please try again.",
+                "Errore durante il caricamento dei documenti. Riprova.",
                 ephemeral=True
             )
 
-class DocumentUploadModal(discord.ui.Modal, title="Upload Document"):
+class DocumentUploadModal(discord.ui.Modal, title="Carica Documento"):
     context_input = discord.ui.TextInput(
-        label="Context",
-        placeholder="Provide context for this document...",
+        label="Contesto",
+        placeholder="Fornisci il contesto per questo documento...",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=1000
     )
-    
+
     file_input = discord.ui.TextInput(
-        label="Document Content",
-        placeholder="Paste your document content here...",
+        label="Contenuto del Documento",
+        placeholder="Incolla qui il contenuto del documento...",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=2000
     )
-    
+
     async def on_submit(self, interaction: discord.Interaction):
         self.context_text = self.context_input.value
-        
-        # Validate file content
+
         if not validate_file(self.file_input.value):
             await interaction.response.send_message(
-                "Invalid file content. Please try again.",
+                "Contenuto del documento non valido. Riprova.",
                 ephemeral=True
             )
             return
-            
+
         self.file_content = self.file_input.value.encode()
         await interaction.response.send_message(
-            "Document prepared for upload!",
+            "Documento pronto per il caricamento!",
             ephemeral=True
         )
 
@@ -109,23 +134,77 @@ class DocumentHandler(commands.Cog):
         self.bot = bot
 
     @app_commands.command(
-        name="documents",
-        description="Upload a document with context"
+        name="documenti",
+        description="Carica più documenti con un nome specifico"
+    )
+    @app_commands.describe(
+        nome="Nome per identificare questi documenti"
     )
     @app_commands.checks.has_permissions(attach_files=True)
-    async def documents(self, interaction: discord.Interaction):
+    async def documents(self, interaction: discord.Interaction, nome: str):
         try:
-            view = DocumentUploadView()
+            view = DocumentUploadView(name=nome)
             await interaction.response.send_message(
-                "Use the buttons below to upload your document:",
+                f"Caricamento documenti per '{nome}'.\nUsa i pulsanti qui sotto per caricare i tuoi documenti:",
                 view=view,
                 ephemeral=True
             )
-            
+
         except Exception as e:
             logger.error(f"Error in documents command: {e}")
             await interaction.response.send_message(
-                "An error occurred while processing your request.",
+                "Si è verificato un errore durante l'elaborazione della richiesta.",
+                ephemeral=True
+            )
+
+    @app_commands.command(
+        name="attivita",
+        description="Mostra tutti i documenti per un nome specifico"
+    )
+    @app_commands.describe(
+        nome="Nome dei documenti da cercare"
+    )
+    async def activities(self, interaction: discord.Interaction, nome: str):
+        try:
+            # Query documents from database
+            documents = Document.query.filter_by(name=nome).all()
+
+            if not documents:
+                await interaction.response.send_message(
+                    f"Nessun documento trovato per '{nome}'.",
+                    ephemeral=True
+                )
+                return
+
+            # Send documents
+            files = []
+            embeds = []
+
+            for idx, doc in enumerate(documents, 1):
+                file = discord.File(
+                    io.BytesIO(doc.content),
+                    filename=f"documento_{idx}.txt"
+                )
+                files.append(file)
+
+                embed = create_document_embed(
+                    author=interaction.user,
+                    context=doc.context,
+                    index=idx,
+                    name=nome
+                )
+                embeds.append(embed)
+
+            await interaction.response.send_message(
+                f"Documenti trovati per '{nome}':",
+                embeds=embeds,
+                files=files
+            )
+
+        except Exception as e:
+            logger.error(f"Error in activities command: {e}")
+            await interaction.response.send_message(
+                "Si è verificato un errore durante la ricerca dei documenti.",
                 ephemeral=True
             )
 
@@ -133,13 +212,13 @@ class DocumentHandler(commands.Cog):
     async def documents_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
             await interaction.response.send_message(
-                "You don't have permission to upload documents!",
+                "Non hai i permessi per caricare documenti!",
                 ephemeral=True
             )
         else:
             logger.error(f"Unexpected error in documents command: {error}")
             await interaction.response.send_message(
-                "An unexpected error occurred. Please try again later.",
+                "Si è verificato un errore imprevisto. Riprova più tardi.",
                 ephemeral=True
             )
 
