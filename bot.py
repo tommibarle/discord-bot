@@ -24,9 +24,11 @@ class DocBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        # Load the document handler cog
+        # Load all cogs
         await self.load_extension("cogs.document_handler")
         logger.info("Document handler cog loaded")
+        await self.load_extension("cogs.admin_commands")
+        logger.info("Admin commands cog loaded")
 
     async def on_ready(self):
         logger.info(f"Bot is ready! Logged in as {self.user}")

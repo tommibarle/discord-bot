@@ -20,6 +20,7 @@ db.init_app(app)
 
 with app.app_context():
     from models.document import Document
+    from models.activity import Inspection, Sanction
     db.create_all()
 
 if __name__ == "__main__":
