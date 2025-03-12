@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app import app, db
 from models.document import Document
 from models.activity import Inspection, Sanction
@@ -30,11 +30,19 @@ class AdminCommands(commands.Cog):
         attachment: discord.Attachment
     ):
         try:
+            logger.debug(f"Starting inspection upload for activity: {activity}")
+            logger.debug(f"Attachment details - Name: {attachment.filename}, Size: {attachment.size}")
+
+            # First defer the response to prevent timeout
+            await interaction.response.defer()
+
             # Download the attachment
             content = await attachment.read()
+            logger.debug("Successfully read attachment content")
 
             # Create inspection record
             with app.app_context():
+                logger.debug(f"Creating inspection record for {activity}")
                 inspection = Inspection(
                     activity_name=activity,
                     content=content,
@@ -43,10 +51,12 @@ class AdminCommands(commands.Cog):
                 )
                 db.session.add(inspection)
                 db.session.commit()
+                logger.debug("Inspection record created successfully")
 
             # Create a more descriptive filename
-            filename = f"ispezione_{activity}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
+            filename = f"ispezione_{activity}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
             filename = "".join(c for c in filename if c.isalnum() or c in "._-")
+            logger.debug(f"Generated filename: {filename}")
 
             # Send confirmation with the file
             file = discord.File(
@@ -58,24 +68,31 @@ class AdminCommands(commands.Cog):
                 title=f"Ispezione per {activity}",
                 description="Ispezione caricata con successo",
                 color=discord.Color.blue(),
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(timezone.utc)
             )
             embed.set_author(
                 name=interaction.user.display_name,
                 icon_url=interaction.user.display_avatar.url
             )
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=embed,
                 file=file
             )
+            logger.debug("Inspection response sent successfully")
 
         except Exception as e:
             logger.error(f"Error in inspection command: {e}", exc_info=True)
-            await interaction.response.send_message(
-                "Si è verificato un errore durante il caricamento dell'ispezione.",
-                ephemeral=True
-            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Si è verificato un errore durante il caricamento dell'ispezione.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "Si è verificato un errore durante il caricamento dell'ispezione.",
+                    ephemeral=True
+                )
 
     @app_commands.command(
         name="sanzione",
@@ -141,12 +158,13 @@ class AdminCommands(commands.Cog):
         user: discord.Member
     ):
         try:
-            # Calculate date range
-            end_date = datetime.utcnow()
+            # Calculate date range using timezone-aware datetime
+            end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=7)
+            logger.debug(f"Calculating salary for {user.display_name} between {start_date} and {end_date}")
 
             with app.app_context():
-                # Count documents
+                # Count documents with proper date filtering
                 regular_docs = Document.query.filter(
                     Document.author_id == str(user.id),
                     Document.created_at >= start_date,
@@ -175,7 +193,7 @@ class AdminCommands(commands.Cog):
                 title=f"Calcolo Stipendio per {user.display_name}",
                 description=f"Periodo: ultimi 7 giorni",
                 color=discord.Color.green(),
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(timezone.utc)
             )
 
             embed.add_field(
@@ -209,7 +227,6 @@ class AdminCommands(commands.Cog):
             )
 
     @ispezione.error
-    @sanzione.error
     @stipendio.error
     async def admin_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
