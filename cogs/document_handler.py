@@ -6,45 +6,11 @@ from typing import Optional, List, Dict
 import io
 from utils.validators import validate_file
 from utils.embed_builder import create_document_embed
-from app import app, db
-from models.document import Document
-import asyncio
-from functools import partial
+from utils.file_storage import save_documents, save_document, get_user_storage_path
+import os
+import json
 
 logger = logging.getLogger(__name__)
-
-# Global document storage to persist state
-document_storage: Dict[str, List[Dict]] = {}
-
-async def save_documents_to_db(documents, name, author_id, author_name):
-    """
-    Save documents to database in a separate function.
-    Returns True if successful, False otherwise.
-    """
-    try:
-        logger.debug(f"Attempting to save {len(documents)} documents with name: {name}")
-        with app.app_context():
-            logger.debug("Starting database transaction")
-            for doc in documents:
-                db_doc = Document(
-                    name=name,
-                    content=doc['content'],
-                    context=doc['context'],
-                    author_id=author_id,
-                    author_name=author_name
-                )
-                db.session.add(db_doc)
-                logger.debug(f"Added document to session: {db_doc.name}")
-
-            logger.debug("Committing transaction")
-            db.session.commit()
-            logger.debug("Transaction committed successfully")
-            return True
-    except Exception as e:
-        logger.error(f"Database error: {e}", exc_info=True)
-        with app.app_context():
-            db.session.rollback()
-        return False
 
 class DocumentTypeSelect(discord.ui.View):
     def __init__(self):
@@ -102,20 +68,29 @@ class DocumentUploadView(discord.ui.View):
     def __init__(self, name: str, user_id: str, timeout: Optional[float] = 180):
         super().__init__(timeout=timeout)
         self.name = name
-        self.storage_key = f"{name}_{user_id}"  # Make storage key unique per user
-        if self.storage_key not in document_storage:
-            document_storage[self.storage_key] = []
-        logger.debug(f"Created new view with storage key: {self.storage_key}, current docs: {len(self.documents)}")
+        self.user_id = user_id
+        self.temp_dir = os.path.join(get_user_storage_path(user_id), f"temp_{name}")
+        if not os.path.exists(self.temp_dir):
+            os.makedirs(self.temp_dir)
+        logger.debug(f"Created temp directory: {self.temp_dir}")
 
     @property
-    def documents(self):
-        docs = document_storage.get(self.storage_key, [])
-        logger.debug(f"Retrieving documents for key {self.storage_key}, count: {len(docs)}")
+    def documents(self) -> List[Dict]:
+        docs = []
+        if os.path.exists(self.temp_dir):
+            for filename in os.listdir(self.temp_dir):
+                if filename.endswith('.json'):
+                    with open(os.path.join(self.temp_dir, filename), 'r') as f:
+                        doc_info = json.load(f)
+                        with open(os.path.join(self.temp_dir, doc_info['content_file']), 'rb') as cf:
+                            doc_info['content'] = cf.read()
+                        docs.append(doc_info)
+        logger.debug(f"Found {len(docs)} documents in temp storage")
         return docs
 
     @discord.ui.button(label="Allega Documento", style=discord.ButtonStyle.primary)
     async def attach_document(self, interaction: discord.Interaction, button: discord.ui.Button):
-        logger.debug(f"Attach document button clicked for storage key: {self.storage_key}")
+        logger.debug(f"Attach document button clicked")
         view = DocumentTypeSelect()
         await interaction.response.send_message("Seleziona il tipo di documento:", view=view, ephemeral=True)
 
@@ -130,12 +105,22 @@ class DocumentUploadView(discord.ui.View):
                 logger.warning("No file content after modal submission")
                 return
 
-            # Add document to the storage
-            document_storage[self.storage_key].append({
-                'content': view.modal.file_content,
-                'context': view.modal.context_text
-            })
-            logger.debug(f"Added document. Total documents: {len(self.documents)}")
+            # Save document to temporary storage
+            success = save_document(
+                user_id=self.user_id,
+                name=f"temp_{self.name}",
+                content=view.modal.file_content,
+                context=view.modal.context_text,
+                temp_dir=self.temp_dir
+            )
+
+            if not success:
+                logger.error("Failed to save document to temporary storage")
+                await interaction.followup.send(
+                    "Errore durante il salvataggio temporaneo del documento.",
+                    ephemeral=True
+                )
+                return
 
             # Update button label
             button.label = f"Documenti Allegati: {len(self.documents)}"
@@ -162,7 +147,7 @@ class DocumentUploadView(discord.ui.View):
         logger.debug(f"Submit button clicked. Documents count: {len(self.documents)}")
 
         if not self.documents:
-            logger.warning(f"No documents found in storage for key: {self.storage_key}")
+            logger.warning(f"No documents found in temp storage")
             await interaction.response.send_message(
                 "Per favore allega almeno un documento prima!",
                 ephemeral=True
@@ -171,14 +156,12 @@ class DocumentUploadView(discord.ui.View):
 
         try:
             # First defer the response to prevent timeout
-            logger.debug("Deferring response")
             await interaction.response.defer(ephemeral=True)
 
             files = []
             embeds = []
 
             for idx, doc in enumerate(self.documents, 1):
-                # Create Discord file and embed
                 file = discord.File(
                     io.BytesIO(doc['content']),
                     filename=f"documento_{idx}.txt"
@@ -193,39 +176,37 @@ class DocumentUploadView(discord.ui.View):
                 )
                 embeds.append(embed)
 
-            # Send documents to channel first
-            logger.debug("Sending documents to channel")
+            # Send documents to channel
             message = await interaction.channel.send(
                 embeds=embeds,
                 files=files
             )
 
-            # Save to database using the function
-            logger.debug("Starting database save operation")
-            success = await save_documents_to_db(
+            # Save documents using file storage
+            logger.debug("Starting final file storage save operation")
+            success = save_documents(
                 self.documents,
                 self.name,
-                str(interaction.user.id),
-                interaction.user.display_name
+                str(interaction.user.id)
             )
 
             if not success:
-                logger.error("Database save operation failed")
+                logger.error("File storage save operation failed")
                 if message:
                     await message.delete()
                 await interaction.followup.send(
-                    "Errore durante il salvataggio dei documenti nel database.",
+                    "Errore durante il salvataggio dei documenti.",
                     ephemeral=True
                 )
                 return
 
-            # Clean up storage after successful save
-            if self.storage_key in document_storage:
-                del document_storage[self.storage_key]
-                logger.debug(f"Cleaned up storage for key: {self.storage_key}")
+            # Clean up temporary storage
+            import shutil
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+                logger.debug(f"Cleaned up temp directory: {self.temp_dir}")
 
-            # Send success message using followup
-            logger.debug("Sending success message")
+            # Send success message
             await interaction.followup.send(
                 "Documenti caricati con successo!",
                 ephemeral=True
