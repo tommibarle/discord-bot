@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict
 import io
 from utils.validators import validate_file
 from utils.embed_builder import create_document_embed
@@ -12,6 +12,9 @@ import asyncio
 from functools import partial
 
 logger = logging.getLogger(__name__)
+
+# Global document storage to persist state
+document_storage: Dict[str, List[Dict]] = {}
 
 async def save_documents_to_db(documents, name, author_id, author_name):
     """
@@ -48,6 +51,7 @@ class DocumentTypeSelect(discord.ui.View):
         super().__init__()
         self.context = None
         self.modal = None
+        self.file_content = None
 
     @discord.ui.select(
         placeholder="Seleziona il tipo di documento",
@@ -61,10 +65,10 @@ class DocumentTypeSelect(discord.ui.View):
         ]
     )
     async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+        logger.debug("Document type selected")
         self.context = select.values[0]
         self.modal = DocumentUploadModal(self.context)
         await interaction.response.send_modal(self.modal)
-
 
 class DocumentUploadModal(discord.ui.Modal, title="Carica Documento"):
     def __init__(self, context_type: str):
@@ -95,42 +99,70 @@ class DocumentUploadModal(discord.ui.Modal, title="Carica Documento"):
         )
 
 class DocumentUploadView(discord.ui.View):
-    def __init__(self, name: str, timeout: Optional[float] = 180):
+    def __init__(self, name: str, user_id: str, timeout: Optional[float] = 180):
         super().__init__(timeout=timeout)
-        self.documents = []
         self.name = name
+        self.storage_key = f"{name}_{user_id}"  # Make storage key unique per user
+        if self.storage_key not in document_storage:
+            document_storage[self.storage_key] = []
+        logger.debug(f"Created new view with storage key: {self.storage_key}, current docs: {len(self.documents)}")
+
+    @property
+    def documents(self):
+        docs = document_storage.get(self.storage_key, [])
+        logger.debug(f"Retrieving documents for key {self.storage_key}, count: {len(docs)}")
+        return docs
 
     @discord.ui.button(label="Allega Documento", style=discord.ButtonStyle.primary)
     async def attach_document(self, interaction: discord.Interaction, button: discord.ui.Button):
-        logger.debug("Attach document button clicked")
+        logger.debug(f"Attach document button clicked for storage key: {self.storage_key}")
         view = DocumentTypeSelect()
         await interaction.response.send_message("Seleziona il tipo di documento:", view=view, ephemeral=True)
-        await view.wait()
 
-        if view.context and view.modal and hasattr(view.modal, 'file_content'):
-            self.documents.append({
+        try:
+            await view.wait()
+            if not view.modal:
+                logger.warning("No modal created after selection")
+                return
+
+            await view.modal.wait()
+            if not hasattr(view.modal, 'file_content'):
+                logger.warning("No file content after modal submission")
+                return
+
+            # Add document to the storage
+            document_storage[self.storage_key].append({
                 'content': view.modal.file_content,
                 'context': view.modal.context_text
             })
             logger.debug(f"Added document. Total documents: {len(self.documents)}")
 
+            # Update button label
             button.label = f"Documenti Allegati: {len(self.documents)}"
 
             try:
-                logger.debug("Updating view with new button label")
                 await interaction.message.edit(view=self)
+                logger.debug("View updated successfully")
             except Exception as e:
-                logger.error(f"Error updating view: {e}")
+                logger.error(f"Failed to update view: {e}")
                 await interaction.followup.send(
-                    "Documento allegato con successo!",
+                    f"Documento allegato con successo! (Totale: {len(self.documents)})",
                     ephemeral=True
                 )
 
+        except Exception as e:
+            logger.error(f"Error in document attachment process: {e}", exc_info=True)
+            await interaction.followup.send(
+                "Si è verificato un errore durante l'allegamento del documento.",
+                ephemeral=True
+            )
+
     @discord.ui.button(label="Invia", style=discord.ButtonStyle.green)
     async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        logger.debug("Submit button clicked")
+        logger.debug(f"Submit button clicked. Documents count: {len(self.documents)}")
 
         if not self.documents:
+            logger.warning(f"No documents found in storage for key: {self.storage_key}")
             await interaction.response.send_message(
                 "Per favore allega almeno un documento prima!",
                 ephemeral=True
@@ -168,7 +200,7 @@ class DocumentUploadView(discord.ui.View):
                 files=files
             )
 
-            # Save to database using the new function
+            # Save to database using the function
             logger.debug("Starting database save operation")
             success = await save_documents_to_db(
                 self.documents,
@@ -186,6 +218,11 @@ class DocumentUploadView(discord.ui.View):
                     ephemeral=True
                 )
                 return
+
+            # Clean up storage after successful save
+            if self.storage_key in document_storage:
+                del document_storage[self.storage_key]
+                logger.debug(f"Cleaned up storage for key: {self.storage_key}")
 
             # Send success message using followup
             logger.debug("Sending success message")
@@ -220,7 +257,7 @@ class DocumentHandler(commands.Cog):
     @app_commands.checks.has_permissions(attach_files=True)
     async def documents(self, interaction: discord.Interaction, nome: str):
         try:
-            view = DocumentUploadView(name=nome)
+            view = DocumentUploadView(name=nome, user_id=str(interaction.user.id))
             await interaction.response.send_message(
                 f"Caricamento documenti per '{nome}'.\nUsa i pulsanti qui sotto per caricare i tuoi documenti:",
                 view=view,
@@ -231,58 +268,6 @@ class DocumentHandler(commands.Cog):
             logger.error(f"Error in documents command: {e}")
             await interaction.response.send_message(
                 "Si è verificato un errore durante l'elaborazione della richiesta.",
-                ephemeral=True
-            )
-
-    @app_commands.command(
-        name="attivita",
-        description="Mostra tutti i documenti per un nome specifico"
-    )
-    @app_commands.describe(
-        nome="Nome dei documenti da cercare"
-    )
-    async def activities(self, interaction: discord.Interaction, nome: str):
-        try:
-            with app.app_context():
-                # Query documents from database
-                documents = Document.query.filter_by(name=nome).all()
-
-            if not documents:
-                await interaction.response.send_message(
-                    f"Nessun documento trovato per '{nome}'.",
-                    ephemeral=True
-                )
-                return
-
-            # Send documents
-            files = []
-            embeds = []
-
-            for idx, doc in enumerate(documents, 1):
-                file = discord.File(
-                    io.BytesIO(doc.content),
-                    filename=f"documento_{idx}.txt"
-                )
-                files.append(file)
-
-                embed = create_document_embed(
-                    author=interaction.user,
-                    context=doc.context,
-                    index=idx,
-                    name=nome
-                )
-                embeds.append(embed)
-
-            await interaction.response.send_message(
-                f"Documenti trovati per '{nome}':",
-                embeds=embeds,
-                files=files
-            )
-
-        except Exception as e:
-            logger.error(f"Error in activities command: {e}")
-            await interaction.response.send_message(
-                "Si è verificato un errore durante la ricerca dei documenti.",
                 ephemeral=True
             )
 
