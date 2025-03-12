@@ -21,7 +21,7 @@ async def save_documents_to_db(documents, name, author_id, author_name):
     try:
         logger.debug(f"Attempting to save {len(documents)} documents with name: {name}")
         with app.app_context():
-            logger.debug("Starting database transaction")
+            logger.debug(f"Starting database transaction for {name}")
             for doc in documents:
                 db_doc = Document(
                     name=name,
@@ -31,7 +31,7 @@ async def save_documents_to_db(documents, name, author_id, author_name):
                     author_name=author_name
                 )
                 db.session.add(db_doc)
-                logger.debug(f"Added document to session: {db_doc.name}")
+                logger.debug(f"Added document to session: {name} - Context: {doc['context'][:30]}...")
 
             logger.debug("Committing transaction")
             db.session.commit()
@@ -46,8 +46,9 @@ async def save_documents_to_db(documents, name, author_id, author_name):
 class DocumentUploadView(discord.ui.View):
     def __init__(self, name: str, timeout: Optional[float] = 180):
         super().__init__(timeout=timeout)
-        self.documents = []  # List to store multiple documents
+        self.documents = []
         self.name = name
+        logger.debug(f"Created DocumentUploadView with name: {name}")
 
     @discord.ui.button(label="Allega Documento", style=discord.ButtonStyle.primary)
     async def attach_document(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -98,10 +99,16 @@ class DocumentUploadView(discord.ui.View):
             embeds = []
 
             for idx, doc in enumerate(self.documents, 1):
+                # Create a more descriptive filename using the name and content preview
+                content_preview = doc['context'][:30].replace(" ", "_")  # First 30 chars of context
+                filename = f"{self.name}_{content_preview}_{idx}.txt"
+                filename = "".join(c for c in filename if c.isalnum() or c in "._-")  # Sanitize filename
+                logger.debug(f"Generated filename: {filename}")
+
                 # Create Discord file and embed
                 file = discord.File(
                     io.BytesIO(doc['content']),
-                    filename=f"documento_{idx}.txt"
+                    filename=filename
                 )
                 files.append(file)
 
@@ -244,9 +251,14 @@ class DocumentHandler(commands.Cog):
             embeds = []
 
             for idx, doc in enumerate(documents, 1):
+                # Create descriptive filename using content preview
+                content_preview = doc.context[:30].replace(" ", "_")
+                filename = f"{nome}_{content_preview}_{idx}.txt"
+                filename = "".join(c for c in filename if c.isalnum() or c in "._-")  # Sanitize filename
+
                 file = discord.File(
                     io.BytesIO(doc.content),
-                    filename=f"documento_{idx}.txt"
+                    filename=filename
                 )
                 files.append(file)
 
