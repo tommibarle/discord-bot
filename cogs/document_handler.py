@@ -43,36 +43,84 @@ async def save_documents_to_db(documents, name, author_id, author_name):
             db.session.rollback()
         return False
 
+class DocumentTypeSelect(discord.ui.View):
+    def __init__(self):
+        super().__init__()
+        self.context = None
+        self.modal = None
+
+    @discord.ui.select(
+        placeholder="Seleziona il tipo di documento",
+        options=[
+            discord.SelectOption(label="CPI", description="Certificato Prevenzione Incendi"),
+            discord.SelectOption(label="HARCP", description="Hazard Analysis and Critical Control Points"),
+            discord.SelectOption(label="Lic.Alcohol", description="Licenza Alcol"),
+            discord.SelectOption(label="Mod. FoodTruck", description="Modulo FoodTruck"),
+            discord.SelectOption(label="Lic.Security", description="Licenza Sicurezza"),
+            discord.SelectOption(label="Other", description="Altro tipo di documento")
+        ]
+    )
+    async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.context = select.values[0]
+        self.modal = DocumentUploadModal(self.context)
+        await interaction.response.send_modal(self.modal)
+
+
+class DocumentUploadModal(discord.ui.Modal, title="Carica Documento"):
+    def __init__(self, context_type: str):
+        super().__init__(title="Carica Documento")
+        self.context_type = context_type
+
+    file_input = discord.ui.TextInput(
+        label="Contenuto del Documento",
+        placeholder="Incolla qui il contenuto del documento...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not validate_file(self.file_input.value):
+            await interaction.response.send_message(
+                "Contenuto del documento non valido. Riprova.",
+                ephemeral=True
+            )
+            return
+
+        self.file_content = self.file_input.value.encode()
+        self.context_text = self.context_type
+        await interaction.response.send_message(
+            f"Documento di tipo {self.context_type} pronto per il caricamento!",
+            ephemeral=True
+        )
+
 class DocumentUploadView(discord.ui.View):
     def __init__(self, name: str, timeout: Optional[float] = 180):
         super().__init__(timeout=timeout)
-        self.documents = []  # List to store multiple documents
+        self.documents = []
         self.name = name
 
     @discord.ui.button(label="Allega Documento", style=discord.ButtonStyle.primary)
     async def attach_document(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.debug("Attach document button clicked")
-        modal = DocumentUploadModal()
-        await interaction.response.send_modal(modal)
-        await modal.wait()
+        view = DocumentTypeSelect()
+        await interaction.response.send_message("Seleziona il tipo di documento:", view=view, ephemeral=True)
+        await view.wait()
 
-        if modal.file_content and modal.context_text:
+        if view.context and view.modal and hasattr(view.modal, 'file_content'):
             self.documents.append({
-                'content': modal.file_content,
-                'context': modal.context_text
+                'content': view.modal.file_content,
+                'context': view.modal.context_text
             })
             logger.debug(f"Added document. Total documents: {len(self.documents)}")
 
-            # Update button label to show document count
             button.label = f"Documenti Allegati: {len(self.documents)}"
 
-            # Use edit_original_response instead of edit_original_message
             try:
                 logger.debug("Updating view with new button label")
                 await interaction.message.edit(view=self)
             except Exception as e:
                 logger.error(f"Error updating view: {e}")
-                # If edit fails, at least confirm to the user
                 await interaction.followup.send(
                     "Documento allegato con successo!",
                     ephemeral=True
@@ -157,39 +205,6 @@ class DocumentUploadView(discord.ui.View):
                 )
             except discord.errors.InteractionNotFound:
                 logger.error("Could not send error message - interaction expired")
-
-class DocumentUploadModal(discord.ui.Modal, title="Carica Documento"):
-    context_input = discord.ui.TextInput(
-        label="Contesto",
-        placeholder="Fornisci il contesto per questo documento...",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1000
-    )
-
-    file_input = discord.ui.TextInput(
-        label="Contenuto del Documento",
-        placeholder="Incolla qui il contenuto del documento...",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=2000
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        self.context_text = self.context_input.value
-
-        if not validate_file(self.file_input.value):
-            await interaction.response.send_message(
-                "Contenuto del documento non valido. Riprova.",
-                ephemeral=True
-            )
-            return
-
-        self.file_content = self.file_input.value.encode()
-        await interaction.response.send_message(
-            "Documento pronto per il caricamento!",
-            ephemeral=True
-        )
 
 class DocumentHandler(commands.Cog):
     def __init__(self, bot: commands.Bot):
