@@ -8,8 +8,40 @@ from utils.validators import validate_file
 from utils.embed_builder import create_document_embed
 from app import app, db
 from models.document import Document
+import asyncio
+from functools import partial
 
 logger = logging.getLogger(__name__)
+
+async def save_documents_to_db(documents, name, author_id, author_name):
+    """
+    Save documents to database in a separate function.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        logger.debug(f"Attempting to save {len(documents)} documents with name: {name}")
+        with app.app_context():
+            logger.debug("Starting database transaction")
+            for doc in documents:
+                db_doc = Document(
+                    name=name,
+                    content=doc['content'],
+                    context=doc['context'],
+                    author_id=author_id,
+                    author_name=author_name
+                )
+                db.session.add(db_doc)
+                logger.debug(f"Added document to session: {db_doc.name}")
+
+            logger.debug("Committing transaction")
+            db.session.commit()
+            logger.debug("Transaction committed successfully")
+            return True
+    except Exception as e:
+        logger.error(f"Database error: {e}", exc_info=True)
+        with app.app_context():
+            db.session.rollback()
+        return False
 
 class DocumentUploadView(discord.ui.View):
     def __init__(self, name: str, timeout: Optional[float] = 180):
@@ -19,6 +51,7 @@ class DocumentUploadView(discord.ui.View):
 
     @discord.ui.button(label="Allega Documento", style=discord.ButtonStyle.primary)
     async def attach_document(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.debug("Attach document button clicked")
         modal = DocumentUploadModal()
         await interaction.response.send_modal(modal)
         await modal.wait()
@@ -28,12 +61,14 @@ class DocumentUploadView(discord.ui.View):
                 'content': modal.file_content,
                 'context': modal.context_text
             })
+            logger.debug(f"Added document. Total documents: {len(self.documents)}")
 
             # Update button label to show document count
             button.label = f"Documenti Allegati: {len(self.documents)}"
 
             # Use edit_original_response instead of edit_original_message
             try:
+                logger.debug("Updating view with new button label")
                 await interaction.message.edit(view=self)
             except Exception as e:
                 logger.error(f"Error updating view: {e}")
@@ -85,34 +120,24 @@ class DocumentUploadView(discord.ui.View):
                 files=files
             )
 
-            # Use Flask app context for database operations
-            with app.app_context():
-                try:
-                    logger.debug("Adding documents to database")
-                    # Add all documents to the database
-                    for doc in self.documents:
-                        db_doc = Document(
-                            name=self.name,
-                            content=doc['content'],
-                            context=doc['context'],
-                            author_id=str(interaction.user.id),
-                            author_name=interaction.user.display_name
-                        )
-                        db.session.add(db_doc)
+            # Save to database using the new function
+            logger.debug("Starting database save operation")
+            success = await save_documents_to_db(
+                self.documents,
+                self.name,
+                str(interaction.user.id),
+                interaction.user.display_name
+            )
 
-                    logger.debug("Committing to database")
-                    db.session.commit()
-                    logger.debug("Database commit successful")
-                except Exception as e:
-                    logger.error(f"Database error: {e}", exc_info=True)
-                    db.session.rollback()
-                    if message:
-                        await message.delete()
-                    await interaction.followup.send(
-                        "Errore durante il salvataggio dei documenti nel database.",
-                        ephemeral=True
-                    )
-                    return
+            if not success:
+                logger.error("Database save operation failed")
+                if message:
+                    await message.delete()
+                await interaction.followup.send(
+                    "Errore durante il salvataggio dei documenti nel database.",
+                    ephemeral=True
+                )
+                return
 
             # Send success message using followup
             logger.debug("Sending success message")
