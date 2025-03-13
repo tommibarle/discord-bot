@@ -10,6 +10,8 @@ from app import app, db
 from models.document import Document
 import asyncio
 from functools import partial
+from discord import SelectOption  # Aggiungi questo import
+
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +46,9 @@ async def save_documents_to_db(documents, name, author_id, author_name):
         return False
 
 class DocumentUploadView(discord.ui.View):
-    def __init__(self, name: str, timeout: Optional[float] = 180):
+    def __init__(self, bot: commands.Bot, name: str, timeout: Optional[float] = 180):
         super().__init__(timeout=timeout)
+        self.bot = bot
         self.documents = []
         self.name = name
         logger.debug(f"Created DocumentUploadView with name: {name}")
@@ -53,47 +56,73 @@ class DocumentUploadView(discord.ui.View):
     @discord.ui.button(label="Allega Documento", style=discord.ButtonStyle.primary)
     async def attach_document(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.debug("Attach document button clicked")
-        modal = DocumentUploadModal()
-        await interaction.response.send_modal(modal)
-        await modal.wait()
+        
+        # Crea un menu a tendina per il contesto
+        select_menu = discord.ui.Select(
+            placeholder="Seleziona il contesto",
+            min_values=1,
+            max_values=1,
+            options=[
+                SelectOption(label="CPI", value="CPI"),
+                SelectOption(label="HARCP", value="HARCP"),
+                SelectOption(label="LIC.ALCOLICI", value="LIC.ALCOLICI"),
+                SelectOption(label="LIC.SECURITY", value="LIC.SECURITY"),
+                SelectOption(label="MOD.FOODTRUCK", value="MOD.FOODTRUCK"),
+                SelectOption(label="ALTRI", value="ALTRI")
+            ]
+        )
 
-        if modal.file_content and modal.context_text:
-            self.documents.append({
-                'content': modal.file_content,
-                'context': modal.context_text
-            })
-            logger.debug(f"Added document. Total documents: {len(self.documents)}")
-
-            # Update button label to show document count
-            button.label = f"Documenti Allegati: {len(self.documents)}"
-
-            # Use edit_original_response instead of edit_original_message
-            try:
-                logger.debug("Updating view with new button label")
-                await interaction.message.edit(view=self)
-            except Exception as e:
-                logger.error(f"Error updating view: {e}")
-                # If edit fails, at least confirm to the user
-                await interaction.followup.send(
-                    "Documento allegato con successo!",
-                    ephemeral=True
-                )
-
-    @discord.ui.button(label="Invia", style=discord.ButtonStyle.green)
-    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        logger.debug("Submit button clicked")
-
-        if not self.documents:
-            await interaction.response.send_message(
-                "Per favore allega almeno un documento prima!",
+        async def select_callback(select_interaction: discord.Interaction):
+            if select_interaction.user != interaction.user:
+                return
+                
+            # Mostra un prompt per l'upload dell'immagine
+            await select_interaction.response.send_message(
+                "Carica un'immagine per questo contesto:",
                 ephemeral=True
             )
-            return
 
-        try:
-            # First defer the response to prevent timeout
-            logger.debug("Deferring response")
-            await interaction.response.defer(ephemeral=True)
+            # Aspetta l'upload del file
+            def check(message: discord.Message):
+                return (
+                    message.author == interaction.user and
+                    message.attachments and
+                    message.channel == interaction.channel
+                )
+
+            try:
+                msg = await self.bot.wait_for("message", check=check, timeout=60)
+                attachment = msg.attachments[0]
+                
+                # Validazione immagine
+                if not any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'gif']):
+                    await interaction.followup.send("Formato file non supportato!", ephemeral=True)
+                    return
+                
+                # Aggiungi il documento
+                self.documents.append({
+                    'content': await attachment.read(),
+                    'context': select_menu.values[0]
+                })
+                
+                # Aggiorna il pulsante
+                button.label = f"Documenti Allegati: {len(self.documents)}"
+                await interaction.message.edit(view=self)
+                await msg.delete()
+                
+            except asyncio.TimeoutError:
+                await interaction.followup.send("Tempo scaduto!", ephemeral=True)
+
+        select_menu.callback = select_callback
+        
+        view = discord.ui.View()
+        view.add_item(select_menu)
+        
+        await interaction.response.send_message(
+            "Seleziona il contesto e carica un'immagine:",
+            view=view,
+            ephemeral=True
+        )
 
             files = []
             embeds = []
@@ -204,27 +233,25 @@ class DocumentHandler(commands.Cog):
 
     @app_commands.command(
         name="documenti",
-        description="Carica più documenti con un nome specifico"
+        description="Carica documenti con contesto specifico e immagini"
     )
-    @app_commands.describe(
-        nome="Nome per identificare questi documenti"
-    )
+    @app_commands.describe(nome="Nome per identificare questi documenti")
     @app_commands.checks.has_permissions(attach_files=True)
     async def documents(self, interaction: discord.Interaction, nome: str):
         try:
-            view = DocumentUploadView(name=nome)
+            view = DocumentUploadView(bot=self.bot, name=nome)
             await interaction.response.send_message(
-                f"Caricamento documenti per '{nome}'.\nUsa i pulsanti qui sotto per caricare i tuoi documenti:",
+                f"Caricamento documenti per '{nome}'.\nUsa i pulsanti qui sotto:",
                 view=view,
                 ephemeral=True
             )
-
         except Exception as e:
             logger.error(f"Error in documents command: {e}")
             await interaction.response.send_message(
-                "Si è verificato un errore durante l'elaborazione della richiesta.",
+                "Errore durante l'elaborazione!",
                 ephemeral=True
             )
+
 
     @app_commands.command(
         name="attivita",
